@@ -3,8 +3,11 @@ pipeline {
 
     environment {
         APP_NAME = "todo-app"
-        TEST_URL = "http://localhost:5000"
+        TEST_URL = "http://localhost:5000" // Pastikan ini adalah URL yang dapat diakses dari Jenkins ke aplikasi Flask Anda
         VENV_DIR = "/tmp/jenkins_venv"
+        // Opsional tapi disarankan: ZAP API Key untuk keamanan.
+        // Sebaiknya ini diambil dari Jenkins Credentials. Contoh: ZAP_API_KEY = credentials('ZAP_API_KEY_ID')
+        ZAP_API_KEY = "" // Ganti dengan API Key ZAP Anda jika diaktifkan di ZAP. Jika tidak, biarkan kosong.
     }
 
     stages {
@@ -47,26 +50,61 @@ pipeline {
                 echo '🚀 Run Flask app in background'
                 sh '''
                     set -e
+                    # Hentikan proses Flask yang mungkin berjalan sebelumnya
                     pkill -f "flask run" || true
-                    $VENV_DIR/bin/flask run --host=0.0.0.0 > flask.log 2>&1 &
-                    sleep 10
+                    # Jalankan Flask app di background dan arahkan output ke file log
+                    nohup $VENV_DIR/bin/flask run --host=0.0.0.0 > flask_app.log 2>&1 &
+                    # Beri waktu aplikasi untuk memulai sepenuhnya
+                    sleep 15
                 '''
             }
         }
 
-        
+
         stage('DAST Scan') {
             steps {
                 echo '🛡️ Run OWASP ZAP scan'
-                sh '''
-                    set -e
-                    docker rm -f zap || true
-                    docker run --name zap -u root -v $(pwd):/zap/wrk/:rw -d -p 8091:8090 ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -port 8090 -host 0.0.0.0
-                '''
+                script {
+                    // Hapus kontainer ZAP sebelumnya jika ada
+                    sh 'docker rm -f zap || true'
+
+                    // Jalankan ZAP sebagai daemon. Menggunakan port 8091 di host.
+                    // Pastikan 'api.disablekey=false' jika Anda menggunakan ZAP_API_KEY
+                    sh """
+                        docker run --name zap -u root \\
+                        -v \$(pwd):/zap/wrk/:rw \\
+                        -d -p 8091:8090 \\
+                        ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -port 8090 -host 0.0.0.0 -config api.disablekey=false
+                    """
+
+                    echo 'Waiting for ZAP to start up and be ready...'
+                    sleep 30 // Beri waktu ZAP untuk memulai. Sesuaikan jika perlu.
+
+                    // Tambahkan parameter API key jika diatur
+                    def zapApiKeyParam = env.ZAP_API_KEY ? "&apikey=${env.ZAP_API_KEY}" : ""
+
+                    // Lakukan spidering pada aplikasi Anda
+                    echo "Starting ZAP Spider for ${env.TEST_URL}..."
+                    sh """
+                        curl -s "http://localhost:8091/JSON/spider/action/scan/?url=${env.TEST_URL}${zapApiKeyParam}"
+                    """
+                    sleep 60 // Tunggu spidering selesai. Untuk produksi, polling API status.
+
+                    // Lakukan active scan
+                    echo "Starting ZAP Active Scan for ${env.TEST_URL}..."
+                    sh """
+                        curl -s "http://localhost:8091/JSON/ascan/action/scan/?url=${env.TEST_URL}&recurse=true&inScopeOnly=true${zapApiKeyParam}"
+                    """
+                    sleep 120 // Tunggu active scan selesai. Untuk produksi, polling API status.
+
+                    // Hasilkan laporan HTML dan simpan di direktori yang di-mount (workspace Jenkins)
+                    echo 'Generating ZAP HTML report...'
+                    sh """
+                        curl -s "http://localhost:8091/OTHER/core/action/htmlreport/?${zapApiKeyParam}" > \${WORKSPACE}/zap_report.html
+                    """
+                }
             }
         }
-
-
 
         stage('Deploy to Staging') {
             steps {
@@ -74,7 +112,8 @@ pipeline {
                 sh '''
                     set -e
                     docker build -t ${APP_NAME}:latest .
-                    # docker push yourregistry/${APP_NAME}:latest
+                    # Anda perlu menambahkan langkah docker push ke registry di sini
+                    # Contoh: docker push yourregistry/${APP_NAME}:latest
                 '''
             }
         }
@@ -82,12 +121,18 @@ pipeline {
 
     post {
         always {
-            echo '🧹 Cleanup: stop flask app'
-            sh 'pkill -f "flask run" || true'
+            echo '🧹 Cleanup: stop flask app and ZAP container'
+            sh 'pkill -f "flask run" || true'  // Hentikan Flask app
+            sh 'docker rm -f zap || true'      // Hentikan dan hapus kontainer ZAP
+            // Arsipkan laporan ZAP agar bisa diakses dari Jenkins UI
+            archiveArtifacts artifacts: 'zap_report.html', allowEmpty: true
         }
 
         failure {
             echo '❌ Build failed! Please check logs.'
+        }
+        success {
+            echo '✅ Build successful!'
         }
     }
 }
