@@ -125,7 +125,7 @@ pipeline {
             sh 'pkill -f "flask run" || true'  // Hentikan Flask app
             sh 'docker rm -f zap || true'      // Hentikan dan hapus kontainer ZAP
             // Arsipkan laporan ZAP agar bisa diakses dari Jenkins UI
-            archiveArtifacts artifacts: 'zap_report.html', allowEmpty: true
+            archiveArtifacts artifacts: 'zap_report.html', allowEmptyArchive: true
         }
 
         failure {
